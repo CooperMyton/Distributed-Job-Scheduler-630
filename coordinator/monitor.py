@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timezone
 
 from shared.config import MONITOR_POLL_SEC, WORKER_TIMEOUT_SEC, MAX_JOB_RETRIES
-from shared.models import store
+import shared.models as models
 from metrics.collector import emit
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ class MonitorThread(threading.Thread):
         3. If > worker_timeout: declare dead, trigger takeover for any held job
         """
         now     = datetime.now(timezone.utc)
-        workers = store.get_active_workers()
+        workers = models.store.get_active_workers()
 
         for worker in workers:
             # Make last_heartbeat timezone-aware for comparison
@@ -102,7 +102,7 @@ class MonitorThread(threading.Thread):
                 worker.id, silence, self.worker_timeout
             )
 
-            orphaned_job_id = store.mark_worker_dead(worker.id)
+            orphaned_job_id = models.store.mark_worker_dead(worker.id)
 
             emit({
                 "event":                "worker_died",
@@ -119,14 +119,14 @@ class MonitorThread(threading.Thread):
                 continue
 
             # ── Trigger hot takeover ──────────────────────────────────────────
-            new_status = store.mark_job_takeover(
+            new_status = models.store.mark_job_takeover(
                 job_id            = orphaned_job_id,
                 detection_latency = round(silence, 3),
                 max_retries       = MAX_JOB_RETRIES,
             )
 
             from shared.models import JobStatus
-            job = store.get_job(orphaned_job_id)
+            job = models.store.get_job(orphaned_job_id)
 
             if new_status == JobStatus.PENDING_TAKEOVER:
                 checkpoint_step = (

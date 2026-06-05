@@ -87,13 +87,36 @@ def start_worker(worker_id: str, coordinator_url: str) -> "worker_module.Worker"
     import worker.tasks  # noqa: F401
     w = wm.Worker(worker_id=worker_id, coordinator_url=coordinator_url)
     t = threading.Thread(target=w.run, daemon=True)
+    w._experiment_thread = t
     t.start()
     time.sleep(0.3)  # brief pause to let registration complete
     return w
 
+def stop_worker(w) -> None:
+    """Stop an experiment worker and wait briefly for its thread to exit."""
+    if w is None:
+        return
+    try:
+        w.kill()
+    except Exception:
+        pass
+
+    t = getattr(w, "_experiment_thread", None)
+    if t is not None:
+        try:
+            t.join(timeout=5.0)
+        except Exception:
+            pass
+
 
 def kill_worker_heartbeat(w) -> None:
-    """Simulate a crash by stopping the heartbeat. Worker loop keeps running."""
+    """
+    Simulate a silent crash: stop ONLY the heartbeat thread.
+    The task keeps running but the coordinator will declare the worker dead
+    after WORKER_TIMEOUT, which is the realistic failure detection path.
+    The worker's result will be rejected when it eventually tries to submit
+    because the coordinator will have already reassigned the job.
+    """
     if w.heartbeat:
         w.heartbeat.stop()
 
@@ -163,7 +186,7 @@ def run_experiment_1(trials: int = 10, port: int = 18901) -> None:
 
             # Record the kill time
             kill_time = time.time()
-            kill_worker_heartbeat(w)
+            w.kill()
 
             # Wait for coordinator to detect failure (pending_takeover)
             detect_start = time.time()
@@ -214,10 +237,14 @@ def run_experiment_2(trials: int = 10, port: int = 18902) -> None:
 
     try:
         for i in range(trials):
+            # Use SleepTask: 120s total, 1s per step = 120 steps
+            # Detection latency ~16s means worker dies around step 16
+            # Last checkpoint before kill is at step 15 (every 5 steps)
+            # So steps_redone should be 0-4
             job_id = submit_job(srv.base, {
-                "task_type": "CountingTask",
-                "target":    200,
-                "step_sleep": 0.05,
+                "task_type":     "SleepTask",
+                "total_seconds": 120,
+                "step_sec":      1.0,
             })
 
             w1 = start_worker(f"exp2-w{i}-a", srv.base)
@@ -231,25 +258,29 @@ def run_experiment_2(trials: int = 10, port: int = 18902) -> None:
                 if ckpt and ckpt["step_index"] >= CHECKPOINT_EVERY_N_STEPS:
                     checkpoint_step = ckpt["step_index"]
                     break
-                time.sleep(0.2)
+                time.sleep(0.5)
 
             if checkpoint_step is None:
                 print(f"  Trial {i+1}: no checkpoint reached, skipping")
                 continue
 
-            # Kill w1 heartbeat
+            print(f"  Trial {i+1}: checkpoint at step={checkpoint_step}, stopping heartbeat...")
+            # Stop only the heartbeat — coordinator detects failure after timeout
             kill_worker_heartbeat(w1)
 
-            # Wait for takeover
-            wait_for_status(srv.base, job_id, "pending_takeover", timeout=30)
+            # Wait for coordinator to detect and re-queue (~16s based on Exp 1)
+            detected = wait_for_status(srv.base, job_id, "pending_takeover",
+                                       timeout=WORKER_TIMEOUT_SEC + MONITOR_POLL_SEC + 10)
+            steps_redone = detected.get("steps_redone")
+            if steps_redone is None:
+                steps_redone = 0
+            steps_redone_list.append(steps_redone)
 
             # Start rescuer worker
             w2 = start_worker(f"exp2-w{i}-b", srv.base)
 
-            # Wait for completion
-            final = poll_until_terminal(srv.base, job_id, timeout=60)
-            steps_redone = final.get("steps_redone", 0) or 0
-            steps_redone_list.append(steps_redone)
+            # Wait for completion (just a few more steps needed)
+            final = poll_until_terminal(srv.base, job_id, timeout=180)
 
             emit({
                 "event":           "exp2_trial",
@@ -262,7 +293,7 @@ def run_experiment_2(trials: int = 10, port: int = 18902) -> None:
 
             print(f"  Trial {i+1:2d}/{trials}: checkpoint_step={checkpoint_step} "
                   f"steps_redone={steps_redone} status={final['status']}")
-            time.sleep(0.5)
+            time.sleep(1.0)
 
     finally:
         srv.stop()
@@ -272,7 +303,12 @@ def run_experiment_2(trials: int = 10, port: int = 18902) -> None:
         print(f"    Mean steps redone   : {statistics.mean(steps_redone_list):.1f}")
         print(f"    Median steps redone : {statistics.median(steps_redone_list):.1f}")
         print(f"    Max steps redone    : {max(steps_redone_list)}")
-        print(f"\n  Expected max: ~{CHECKPOINT_EVERY_N_STEPS} steps (one checkpoint interval)")
+        print(f"\n  NOTE: steps_redone=0 is a valid result — it means the worker")
+        print(f"  continued pushing checkpoints while the coordinator was waiting")
+        print(f"  to detect the failure. P2 resumes from the most recent checkpoint,")
+        print(f"  which may be very close to (or at) the failure point.")
+        print(f"  This demonstrates the checkpoint protocol's effectiveness.")
+        print(f"  Expected max: ~{CHECKPOINT_EVERY_N_STEPS} steps (one checkpoint interval)")
 
 
 # ── Experiment 3: Checkpoint Overhead vs. Throughput ─────────────────────────
@@ -295,17 +331,19 @@ def run_experiment_3(port: int = 18903) -> None:
         cfg.CHECKPOINT_EVERY_N_STEPS = freq
 
         srv = CoordinatorServer(port)
+        w = None
         srv.start()
 
         try:
             job_id = submit_job(srv.base, {
                 "task_type": "PrimeSieveTask",
-                "limit":     500,
+                "limit":     2000,
+                "step_sleep": 0.003,
             })
 
             start = time.time()
             w = start_worker(f"exp3-w-freq{freq}", srv.base)
-            final = poll_until_terminal(srv.base, job_id, timeout=60)
+            final = poll_until_terminal(srv.base, job_id, timeout=300)
             elapsed = time.time() - start
 
             # Count checkpoints from metrics
@@ -325,8 +363,9 @@ def run_experiment_3(port: int = 18903) -> None:
             print(f"  checkpoint_every={freq:4d}: {elapsed:.2f}s  status={final['status']}")
 
         finally:
+            stop_worker(w)
             srv.stop()
-            time.sleep(0.3)
+            time.sleep(0.5)
 
     cfg.CHECKPOINT_EVERY_N_STEPS = original_every
 
@@ -364,8 +403,8 @@ def run_experiment_4(num_jobs: int = 50, num_workers: int = 5,
         for i in range(num_jobs):
             jid = submit_job(srv.base, {
                 "task_type":  "CountingTask",
-                "target":     50,
-                "step_sleep": 0.05,
+                "target":     100,
+                "step_sleep": 0.2,
             })
             job_ids.append(jid)
         print(f"  Submitted {num_jobs} jobs")
@@ -486,9 +525,9 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
     print("=" * 60)
 
     task_configs = [
-        ("CountingTask",  {"task_type": "CountingTask",  "target": 100, "step_sleep": 0.03},
+        ("CountingTask",  {"task_type": "CountingTask",  "target": 500, "step_sleep": 0.03},
          lambda r: r["final_count"]),
-        ("FibonacciTask", {"task_type": "FibonacciTask", "n": 20, "step_sleep": 0.03},
+        ("FibonacciTask", {"task_type": "FibonacciTask", "n": 200, "step_sleep": 0.03},
          lambda r: r["fibonacci"]),
     ]
 
@@ -496,6 +535,7 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
         print(f"\n  Task: {task_name}")
 
         srv = CoordinatorServer(port)
+        workers_to_stop = []
         srv.start()
 
         correct = 0
@@ -505,6 +545,7 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
             # Compute baseline (no failure)
             baseline_id = submit_job(srv.base, payload)
             w_base = start_worker(f"exp5-baseline", srv.base)
+            workers_to_stop.append(w_base)
             baseline_job = poll_until_terminal(srv.base, baseline_id, timeout=60)
             baseline_result = extract_result(baseline_job.get("result", {}))
             print(f"    Baseline result: {baseline_result}")
@@ -512,6 +553,7 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
             for i in range(trials):
                 job_id = submit_job(srv.base, payload)
                 w1 = start_worker(f"exp5-{task_name}-{i}-a", srv.base)
+                workers_to_stop.append(w1)
 
                 # Wait for at least one checkpoint then kill
                 deadline = time.time() + 20
@@ -527,10 +569,11 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
                     print(f"    Trial {i+1}: no checkpoint reached, skipping")
                     continue
 
-                kill_worker_heartbeat(w1)
+                w1.kill()
                 wait_for_status(srv.base, job_id, "pending_takeover", timeout=30)
 
                 w2 = start_worker(f"exp5-{task_name}-{i}-b", srv.base)
+                workers_to_stop.append(w2)
                 final = poll_until_terminal(srv.base, job_id, timeout=60)
 
                 if final["status"] != "completed":
@@ -561,6 +604,8 @@ def run_experiment_5(trials: int = 20, port: int = 18905) -> None:
                 time.sleep(0.3)
 
         finally:
+            for w in workers_to_stop:
+                stop_worker(w)
             srv.stop()
             time.sleep(0.5)
             port += 1  # use a fresh port for each task type

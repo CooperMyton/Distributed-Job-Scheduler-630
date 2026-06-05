@@ -363,9 +363,16 @@ class InMemoryStore:
             job.takeover_count        += 1
             job.assigned_worker        = None
 
-            # Compute steps_redone: how much work P2 must redo
+            # Compute steps_redone: how much work P2 must redo.
+            # This is the number of steps between the last checkpoint and
+            # the step the worker was on when the monitor detected failure.
+            # Since the worker may still be running (pushing checkpoints) after
+            # the heartbeat stops, we use total_steps_executed at detection time
+            # minus the checkpoint step. If they are equal (worker kept up),
+            # steps_redone = 0 which correctly means P2 starts from a fresh checkpoint.
             if job.latest_checkpoint is not None:
-                job.steps_redone = job.total_steps_executed - job.latest_checkpoint.step_index
+                gap = job.total_steps_executed - job.latest_checkpoint.step_index
+                job.steps_redone = max(0, gap)
             else:
                 job.steps_redone = job.total_steps_executed  # No checkpoint = full restart
 

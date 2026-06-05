@@ -33,6 +33,8 @@ from typing import Optional
 
 import httpx
 
+import shared.config as cfg
+
 # Add project root to path when running as __main__
 if __name__ == "__main__":
     import os
@@ -162,6 +164,12 @@ class Worker:
         self.worker_id       = worker_id or str(uuid.uuid4())
         self.coordinator_url = coordinator_url
         self.heartbeat:      Optional[HeartbeatThread] = None
+        # Set by experiments to simulate a hard crash mid-execution.
+        # When set, the worker aborts after the current step completes.
+        self._killed         = threading.Event()
+        # Set by kill() to also stop the main poll loop so the killed
+        # worker doesn't re-claim the re-queued job.
+        self._stop_poll      = threading.Event()
 
     # ── Registration ───────────────────────────────────────────────────────────
 
@@ -181,6 +189,18 @@ class Worker:
         self.worker_id = result["worker_id"]
         logger.info("Registered as worker_id=%s", self.worker_id)
         return True
+
+    def kill(self) -> None:
+        """
+        Simulate a hard crash: stop heartbeat AND abort task execution.
+        Also sets _stop_poll so the main loop exits and doesn't re-claim
+        the re-queued job from the coordinator.
+        Used by run_experiment.py for controlled failure injection.
+        """
+        self._killed.set()
+        self._stop_poll.set()
+        if self.heartbeat:
+            self.heartbeat.stop()
 
     # ── Checkpoint callback ────────────────────────────────────────────────────
 
@@ -257,14 +277,29 @@ class Worker:
             job_id           = job_id,
             initial_state    = initial_state,
             initial_step     = initial_step,
-            checkpoint_every = CHECKPOINT_EVERY_N_STEPS,
+            checkpoint_every = cfg.CHECKPOINT_EVERY_N_STEPS,
             on_checkpoint    = self._push_checkpoint,
         )
+
+        # Patch runner's on_step to abort if killed mid-execution
+        def _on_step(step_index: int) -> None:
+            if self._killed.is_set():
+                raise RuntimeError("Worker killed mid-execution (simulated crash)")
+
+        runner.on_step = _on_step
 
         # Run the task — this blocks until completion or exception
         try:
             result = runner.run()
         except Exception as e:
+            if self._killed.is_set():
+                logger.error(
+                    "Worker killed mid-execution: job=%s. Simulated crash will not report /fail.",
+                    job_id,
+                    exc_info=True,
+                )
+                return
+
             logger.error("Task raised exception: job=%s error=%s", job_id, e, exc_info=True)
             http_post(
                 f"{self.coordinator_url}/workers/{self.worker_id}/fail",
@@ -343,6 +378,9 @@ class Worker:
 
                 if job is None:
                     # Queue empty — idle wait
+                    if self._stop_poll.is_set():
+                        logger.info("Worker %s stopped (kill signal).", self.worker_id)
+                        return
                     logger.debug("Queue empty, waiting...")
                     time.sleep(WORKER_POLL_SEC)
                     continue

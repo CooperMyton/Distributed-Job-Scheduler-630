@@ -30,8 +30,9 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from shared.config import MAX_JOB_RETRIES, CHECKPOINT_WARN_SIZE_BYTES
-from shared.models import JobStatus, store
-from coordinator.checkpoint_store import checkpoint_store
+import shared.models as models
+import coordinator.checkpoint_store as checkpoint_storage
+from shared.models import JobStatus
 from metrics.collector import emit
 
 logger = logging.getLogger(__name__)
@@ -127,13 +128,13 @@ def submit_job(request: JobSubmitRequest):
             detail="payload must include 'task_type'"
         )
 
-    job = store.enqueue_job(request.payload)
+    job = models.store.enqueue_job(request.payload)
 
     emit({
         "event":        "job_submitted",
         "job_id":       job.id,
         "task_type":    request.payload.get("task_type"),
-        "queue_depth":  store.queue_depth(),
+        "queue_depth":  models.store.queue_depth(),
     })
 
     logger.info("Job submitted: id=%s type=%s", job.id, request.payload.get("task_type"))
@@ -154,7 +155,7 @@ def list_jobs(status_filter: Optional[str] = None):
     Return all jobs. Optionally filter by status:
         ?status_filter=pending | running | pending_takeover | completed | failed
     """
-    jobs = store.get_all_jobs()
+    jobs = models.store.get_all_jobs()
     if status_filter:
         jobs = [j for j in jobs if j["status"] == status_filter]
     return {"jobs": jobs, "count": len(jobs)}
@@ -167,7 +168,7 @@ def list_jobs(status_filter: Optional[str] = None):
 )
 def get_job(job_id: str):
     """Poll a specific job. Returns full job dict including result when complete."""
-    job = store.get_job(job_id)
+    job = models.store.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     return job
@@ -192,7 +193,7 @@ def register_worker(request: WorkerRegisterRequest):
     """
     import uuid
     worker_id = request.worker_id or str(uuid.uuid4())
-    worker    = store.register_worker(worker_id)
+    worker    = models.store.register_worker(worker_id)
 
     emit({
         "event":     "worker_registered",
@@ -220,7 +221,7 @@ def heartbeat(worker_id: str):
     restarted), it returns acknowledged=False and the worker should
     re-register before continuing.
     """
-    known = store.heartbeat(worker_id)
+    known = models.store.heartbeat(worker_id)
     if not known:
         logger.warning("Heartbeat from unknown worker %s — needs re-registration", worker_id)
         return HeartbeatResponse(
@@ -244,11 +245,11 @@ def poll_job(worker_id: str):
     includes latest_checkpoint with the full state dict. The worker must
     detect this and pass the state to its TaskRunner as initial_state.
     """
-    worker = store.get_worker(worker_id)
+    worker = models.store.get_worker(worker_id)
     if worker is None:
         raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' not registered.")
 
-    job = store.dequeue_job(worker_id)
+    job = models.store.dequeue_job(worker_id)
     if job is None:
         return {"job": None, "message": "Queue empty."}
 
@@ -292,7 +293,7 @@ def push_checkpoint(worker_id: str, request: CheckpointRequest):
     The worker should not treat a rejection as fatal — it just means the
     coordinator has already moved on (declared the worker dead, reassigned the job).
     """
-    ckpt = store.accept_checkpoint(
+    ckpt = models.store.accept_checkpoint(
         job_id     = request.job_id,
         worker_id  = worker_id,
         step_index = request.step_index,
@@ -313,7 +314,7 @@ def push_checkpoint(worker_id: str, request: CheckpointRequest):
         )
 
     # Persist to the checkpoint store backend
-    checkpoint_store.save(ckpt)
+    checkpoint_storage.checkpoint_store.save(ckpt)
 
     if ckpt.size_bytes > CHECKPOINT_WARN_SIZE_BYTES:
         logger.warning(
@@ -358,7 +359,7 @@ def complete_job(worker_id: str, request: CompleteRequest):
 
     On success, the checkpoint is cleaned up (no longer needed).
     """
-    accepted = store.complete_job(
+    accepted = models.store.complete_job(
         job_id      = request.job_id,
         worker_id   = worker_id,
         result      = request.result,
@@ -377,9 +378,9 @@ def complete_job(worker_id: str, request: CompleteRequest):
         )
 
     # Clean up checkpoint — job is done, no need to keep state
-    checkpoint_store.delete(request.job_id)
+    checkpoint_storage.checkpoint_store.delete(request.job_id)
 
-    job = store.get_job(request.job_id)
+    job = models.store.get_job(request.job_id)
     total_time = None
     if job and job["started_at"] and job["completed_at"]:
         from datetime import datetime
@@ -418,7 +419,7 @@ def fail_job(worker_id: str, request: FailRequest):
     On retry, the job is re-queued as PENDING_TAKEOVER (with existing checkpoint)
     or PENDING (if no checkpoint exists). On final failure, it is marked FAILED.
     """
-    result_status = store.fail_job_by_worker(
+    result_status = models.store.fail_job_by_worker(
         job_id     = request.job_id,
         worker_id  = worker_id,
         error      = request.error,
@@ -431,7 +432,7 @@ def fail_job(worker_id: str, request: FailRequest):
             detail=f"Job '{request.job_id}' not found or not assigned to worker '{worker_id}'."
         )
 
-    job = store.get_job(request.job_id)
+    job = models.store.get_job(request.job_id)
 
     emit({
         "event":       "job_failed_by_worker",
@@ -462,7 +463,7 @@ def fail_job(worker_id: str, request: FailRequest):
     tags=["Workers"],
 )
 def list_workers():
-    return {"workers": store.get_all_workers()}
+    return {"workers": models.store.get_all_workers()}
 
 
 @router.get(
@@ -476,12 +477,12 @@ def get_metrics():
     Also includes checkpoint store statistics (count + total bytes).
     Used by scripts/run_experiment.py to poll system state during experiments.
     """
-    stats = store.stats()
+    stats = models.store.stats()
 
     # Add checkpoint store stats if in-memory backend
     from coordinator.checkpoint_store import InMemoryCheckpointStore
-    if isinstance(checkpoint_store, InMemoryCheckpointStore):
-        stats["checkpoints_stored"]     = checkpoint_store.count()
-        stats["checkpoint_total_bytes"] = checkpoint_store.total_bytes()
+    if isinstance(checkpoint_storage.checkpoint_store, InMemoryCheckpointStore):
+        stats["checkpoints_stored"]     = checkpoint_storage.checkpoint_store.count()
+        stats["checkpoint_total_bytes"] = checkpoint_storage.checkpoint_store.total_bytes()
 
     return stats
